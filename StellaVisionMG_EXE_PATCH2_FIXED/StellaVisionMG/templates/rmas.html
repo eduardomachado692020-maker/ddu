@@ -20,7 +20,20 @@
     <div class="col-md-3"><label class="form-label">Produto (SKU)</label><input name="product_sku" class="form-control" required></div>
     <div class="col-md-2"><label class="form-label">Qtde</label><input type="number" name="qtde" class="form-control" value="1"></div>
   </div>
-  <button class="btn btn-primary mt-2">Criar RMA</button>
+  
+  <hr>
+  <h5>Produto da Troca (deixar em branco se for apenas devolução)</h5>
+  <div class="row g-2">
+      <div class="col-md-3">
+          <label for="troca_product_sku" class="form-label">SKU do Novo Produto</label>
+          <input type="text" id="troca_product_sku" name="troca_product_sku" class="form-control product-search">
+      </div>
+      <div class="col-md-2">
+          <label for="troca_qtde" class="form-label">Quantidade</label>
+          <input type="number" id="troca_qtde" name="troca_qtde" class="form-control" value="1" min="1">
+      </div>
+  </div>
+  <button class="btn btn-primary mt-3">Criar RMA</button>
 </form>
 
 <hr>
