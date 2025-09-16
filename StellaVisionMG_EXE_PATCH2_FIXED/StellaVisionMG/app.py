@@ -1,4 +1,4 @@
-import os, sqlite3, json, datetime, re, hashlib, sys, sys
+import os, sqlite3, json, datetime, re, hashlib, sys
 from flask import Flask, render_template, request, redirect, url_for, jsonify, send_file, flash, session, g
 import init_db, seed
 import webbrowser, threading, socket
@@ -642,19 +642,27 @@ def compute_graphs(ini,fim,categoria,cidade,vendedor,incluir_rma, top_metric):
     with conn() as c:
         where, params = apply_filters_where(ini,fim,categoria,cidade,vendedor)
 
-        # Top 10 por faturamento/quantidade
+        # CORREÇÃO 1: Top 10 por faturamento/quantidade por FAMÍLIA (nome + modelo)
         if top_metric == "quantidade":
             sql_top = f"""
-              SELECT p.nome AS label, SUM(si.qtde) v
-              FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
-              WHERE {where} GROUP BY p.id ORDER BY v DESC LIMIT 10
+              SELECT (p.nome || ' - ' || COALESCE(p.modelo, '')) AS label, SUM(si.qtde) v
+              FROM sale_items si
+              JOIN sales s ON s.id = si.sale_id
+              JOIN products p ON p.id = si.product_id
+              WHERE {where}
+              GROUP BY p.nome, p.modelo
+              ORDER BY v DESC LIMIT 10
             """
             label = "Quantidade"
         else:
             sql_top = f"""
-              SELECT p.nome AS label, SUM(si.qtde*si.preco_unit) v
-              FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
-              WHERE {where} GROUP BY p.id ORDER BY v DESC LIMIT 10
+              SELECT (p.nome || ' - ' || COALESCE(p.modelo, '')) AS label, SUM(si.qtde*si.preco_unit) v
+              FROM sale_items si
+              JOIN sales s ON s.id = si.sale_id
+              JOIN products p ON p.id = si.product_id
+              WHERE {where}
+              GROUP BY p.nome, p.modelo
+              ORDER BY v DESC LIMIT 10
             """
             label = "Faturamento (R$)"
         top = c.execute(sql_top, params).fetchall()
@@ -864,7 +872,8 @@ def produtos():
                 ea = p['estoque_atual'] or 0
             except Exception:
                 ea = 0
-            entry['min'] = max(entry['min'], em)
+            # CORREÇÃO 3: Somar os estoques mínimos em vez de pegar o maior
+            entry['min'] += em
             entry['sum'] += ea
             modelo_minmap[key] = entry
     return render_template("produtos.html", produtos=produtos, generated_sku=generated_sku, modelo_minmap=modelo_minmap)
@@ -970,29 +979,46 @@ def vendas():
     if request.method == "POST":
         f = request.form
         data = parse_date(f.get("data")) or datetime.date.today()
-        # cliente inline: procura por nome; atualiza ou insere
+        # CORREÇÃO 2: cliente inline: procura por doc (se houver), senão por nome.
         with conn() as c:
-            row = c.execute("SELECT id FROM customers WHERE nome=?", (f.get("cliente_nome"),)).fetchone()
-            if row:
-                cust_id = row["id"]
-                # atualiza dados do cliente com cidade/telefone/doc informados
+            cust_id = None
+            cliente_doc = (f.get("cliente_doc") or "").strip()
+            cliente_nome = (f.get("cliente_nome") or "").strip()
+
+            # Prioridade 1: Procurar pelo documento (se preenchido)
+            if cliente_doc:
+                row = c.execute("SELECT id FROM customers WHERE doc=?", (cliente_doc,)).fetchone()
+                if row:
+                    cust_id = row["id"]
+            
+            # Prioridade 2: Se não encontrou pelo doc, procura pelo nome
+            if not cust_id and cliente_nome:
+                row = c.execute("SELECT id FROM customers WHERE nome=?", (cliente_nome,)).fetchone()
+                # Apenas usa o cliente encontrado pelo nome se não houver um doc novo a ser inserido
+                if row and not cliente_doc:
+                    cust_id = row["id"]
+
+            if cust_id:
+                # Atualiza dados do cliente existente
                 c.execute(
-                    "UPDATE customers SET cidade=?, telefone=?, doc=? WHERE id=?",
+                    "UPDATE customers SET nome=?, cidade=?, telefone=?, doc=? WHERE id=?",
                     (
+                        cliente_nome,
                         f.get("cliente_cidade"),
                         f.get("cliente_telefone"),
-                        f.get("cliente_doc"),
+                        cliente_doc or None, # Garante que doc vazio seja salvo como NULL
                         cust_id,
                     ),
                 )
             else:
+                # Cria um novo cliente
                 cust_id = c.execute(
                     "INSERT INTO customers(nome,cidade,telefone,doc) VALUES(?,?,?,?)",
                     (
-                        f.get("cliente_nome"),
+                        cliente_nome,
                         f.get("cliente_cidade"),
                         f.get("cliente_telefone"),
-                        f.get("cliente_doc"),
+                        cliente_doc or None,
                     ),
                 ).lastrowid
             cidade_snap = (
@@ -1108,6 +1134,7 @@ def vendas():
 
 @app.route("/rmas", methods=["GET","POST"])
 def rmas():
+    # CORREÇÃO 4: Lógica completa para devolução e troca
     if request.method == "POST":
         f = request.form
         sale_id = int(f.get("sale_id"))
@@ -1118,6 +1145,11 @@ def rmas():
         sale_item_id = int(f.get("sale_item_id"))
         qtde = int(f.get("qtde") or 1)
         sku = f.get("product_sku")
+        
+        # --- NOVOS CAMPOS PARA A TROCA ---
+        troca_sku = (f.get("troca_product_sku") or "").strip()
+        troca_qtde = int(f.get("troca_qtde") or 0)
+        # ------------------------------------
 
         now = datetime.datetime.now()
         codigo = "RMA-" + now.strftime("%Y%m%d%H%M%S")
@@ -1135,15 +1167,31 @@ def rmas():
                                (codigo, sale_id, tipo, motivo, forma, valor_reembolso, "APROVADO", CURRENT_USER_ID, now.isoformat(), now.isoformat())).lastrowid
             pr = c.execute("SELECT id FROM products WHERE sku=?", (sku,)).fetchone()
             if not pr:
-                flash("Produto não encontrado", "danger"); return redirect(url_for("rmas"))
+                flash("Produto devolvido não encontrado", "danger"); return redirect(url_for("rmas"))
             c.execute("INSERT INTO rma_items(rma_id,sale_item_id,product_id,qtde) VALUES(?,?,?,?)", (rma_id, sale_item_id, pr["id"], qtde))
+            
             # Movimentações
-            # entrada do devolvido
+            # 1. Entrada do produto devolvido (lógica original)
             c.execute("INSERT INTO stock_moves(data,product_id,tipo,qtde,origem,ref_id,usuario_id) VALUES(?,?,?,?,?,?,?)",
                       (now.isoformat(), pr["id"], "IN", qtde, "rma_retorno" if tipo=="RETORNO" else "rma_troca", rma_id, CURRENT_USER_ID))
             c.execute("UPDATE products SET estoque_atual=estoque_atual+? WHERE id=?", (qtde, pr["id"]))
-            # se TROCA, saída do novo é feita manualmente em outra venda/lançamento ou poderia ser estendida aqui.
-            flash("RMA criado", "success")
+            
+            # 2. Saída do novo produto na troca (NOVA LÓGICA)
+            if tipo == "TROCA" and troca_sku and troca_qtde > 0:
+                pr_troca = c.execute("SELECT id, estoque_atual FROM products WHERE sku=?", (troca_sku,)).fetchone()
+                if not pr_troca:
+                    flash("Produto da troca não encontrado pelo SKU. A devolução foi registada, mas a saída de stock precisa de ser feita manualmente.", "warning")
+                    return redirect(url_for("rmas"))
+                if pr_troca["estoque_atual"] < troca_qtde:
+                    flash("Stock insuficiente para o produto da troca. A devolução foi registada, mas a saída de stock precisa de ser feita manualmente.", "warning")
+                    return redirect(url_for("rmas"))
+                
+                # Regista saída de stock para o novo produto
+                c.execute("UPDATE products SET estoque_atual=estoque_atual-? WHERE id=?", (troca_qtde, pr_troca["id"]))
+                c.execute("INSERT INTO stock_moves(data,product_id,tipo,qtde,origem,ref_id,usuario_id) VALUES(?,?,?,?,?,?,?)",
+                          (now.isoformat(), pr_troca["id"], "OUT", troca_qtde, "rma_troca_saida", rma_id, CURRENT_USER_ID))
+
+            flash("RMA criado com sucesso", "success")
     with conn() as c:
         rmas = c.execute("SELECT codigo_rma, sale_id, tipo, status, substr(created_at,1,16) created_at FROM rmas ORDER BY id DESC LIMIT 30").fetchall()
     return render_template("rmas.html", rmas=rmas)
