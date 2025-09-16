@@ -1,0 +1,430 @@
+diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@
+-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
++from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+ import sqlite3, datetime
+ from collections import defaultdict
+@@
+-def get_db():
++def get_db():
+     conn = sqlite3.connect('erp.db')
+     conn.row_factory = sqlite3.Row
+     return conn
+@@
+-# ---------- KPI / DASHBOARD ----------
+-def compute_top10(conn, date_from=None, date_to=None):
+-    """
+-    ANTIGO: agrupava por SKU (product_id).
+-    """
+-    q = """
+-      SELECT p.id as product_id, p.name, p.model, p.sku,
+-             SUM(si.qty) as qty_total,
+-             SUM(si.qty * si.unit_price) as revenue_total,
+-             SUM(si.qty * (si.unit_price - si.unit_cost)) as profit_total
+-      FROM sale_items si
+-      JOIN products p ON p.id = si.product_id
+-      JOIN sales s ON s.id = si.sale_id
+-      WHERE 1=1
+-    """
+-    params = []
+-    if date_from:
+-        q += " AND date(s.created_at) >= date(?)"
+-        params.append(date_from)
+-    if date_to:
+-        q += " AND date(s.created_at) <= date(?)"
+-        params.append(date_to)
+-    q += " GROUP BY p.id, p.name, p.model, p.sku ORDER BY qty_total DESC LIMIT 10"
+-    cur = conn.execute(q, params)
+-    return [dict(row) for row in cur.fetchall()]
++def compute_top10_by_family(conn, date_from=None, date_to=None, metric='qty'):
++    """
++    NOVO: agrupa por família (name + model). Métrica: 'qty' | 'revenue' | 'profit'
++    """
++    q = """
++      SELECT
++        (p.name || '|' || COALESCE(p.model,'')) AS family_key,
++        p.name, p.model,
++        SUM(si.qty) AS qty_total,
++        SUM(si.qty * si.unit_price) AS revenue_total,
++        SUM(si.qty * (si.unit_price - si.unit_cost)) AS profit_total
++      FROM sale_items si
++      JOIN products p ON p.id = si.product_id
++      JOIN sales s ON s.id = si.sale_id
++      WHERE 1=1
++    """
++    params = []
++    if date_from:
++        q += " AND date(s.created_at) >= date(?)"
++        params.append(date_from)
++    if date_to:
++        q += " AND date(s.created_at) <= date(?)"
++        params.append(date_to)
++    q += " GROUP BY family_key, p.name, p.model"
++    order_col = {'qty':'qty_total','revenue':'revenue_total','profit':'profit_total'}.get(metric,'qty_total')
++    q += f" ORDER BY {order_col} DESC LIMIT 10"
++    cur = conn.execute(q, params)
++    rows = [dict(row) for row in cur.fetchall()]
++    for r in rows:
++        r['label'] = r['name'] + (f" {r['model']}" if r['model'] else '')
++    return rows
+@@
+-def compute_restock_alerts(conn):
+-    """
+-    ANTIGO: comparava soma do estoque atual com o MAIOR estoque mínimo das variações.
+-    """
+-    q = """
+-      SELECT p.name, p.model,
+-             SUM(p.current_stock) AS stock_sum,
+-             MAX(COALESCE(p.min_stock,0)) AS min_max
+-      FROM products p
+-      GROUP BY p.name, p.model
+-    """
+-    rows = conn.execute(q).fetchall()
+-    alerts = []
+-    for r in rows:
+-        if r['stock_sum'] < r['min_max']:
+-            alerts.append({'name': r['name'], 'model': r['model'],
+-                           'current': r['stock_sum'], 'min_required': r['min_max']})
+-    return alerts
++def compute_restock_alerts(conn):
++    """
++    NOVO: soma os mínimos de todas as variações da família (entry['min_required'] += ms).
++    """
++    q = """
++      SELECT (p.name || '|' || COALESCE(p.model,'')) AS family_key,
++             p.name, p.model,
++             COALESCE(p.current_stock,0) AS cs,
++             COALESCE(p.min_stock,0) AS ms
++      FROM products p
++    """
++    fam = {}
++    for row in conn.execute(q):
++        key = row['family_key']
++        if key not in fam:
++            fam[key] = {'name': row['name'], 'model': row['model'], 'current': 0, 'min_required': 0}
++        fam[key]['current'] += row['cs']
++        fam[key]['min_required'] += row['ms']
++    alerts = []
++    for k,v in fam.items():
++        if v['current'] < v['min_required']:
++            alerts.append(v)
++    return alerts
+@@
+-def upsert_customer(conn, name, phone=None, doc=None, email=None, address=None):
+-    # ANTIGO: chave por nome; podia sobrescrever dados
+-    cur = conn.execute("SELECT id FROM customers WHERE name = ?", (name,))
+-    row = cur.fetchone()
+-    if row:
+-        conn.execute("""UPDATE customers SET phone=?, doc=?, email=?, address=?
+-                        WHERE id=?""", (phone, doc, email, address, row['id']))
+-        return row['id']
+-    cur = conn.execute("""INSERT INTO customers(name, phone, doc, email, address)
+-                          VALUES(?,?,?,?,?)""", (name, phone, doc, email, address))
+-    return cur.lastrowid
++def upsert_customer(conn, name, phone=None, doc=None, email=None, address=None):
++    """
++    NOVO: usa DOC como identificador único; se já existir, atualiza sem apagar dados preenchidos.
++    """
++    norm_doc = (doc or '').strip()
++    if norm_doc:
++        cur = conn.execute("SELECT * FROM customers WHERE doc = ?", (norm_doc,))
++        row = cur.fetchone()
++        if row:
++            new_phone  = phone   if phone   else row['phone']
++            new_email  = email   if email   else row['email']
++            new_addr   = address if address else row['address']
++            new_name   = name    if name    else row['name']
++            conn.execute("""UPDATE customers
++                            SET name=?, phone=?, email=?, address=?
++                            WHERE id=?""", (new_name, new_phone, new_email, new_addr, row['id']))
++            return row['id']
++        cur = conn.execute("""INSERT INTO customers(name, phone, doc, email, address)
++                              VALUES(?,?,?,?,?)""", (name, phone, norm_doc, email, address))
++        return cur.lastrowid
++    cur = conn.execute("SELECT * FROM customers WHERE name=? AND IFNULL(phone,'')=IFNULL(?, '')", (name, phone))
++    row = cur.fetchone()
++    if row:
++        conn.execute("""UPDATE customers SET email=?, address=? WHERE id=?""",
++                     (email or row['email'], address or row['address'], row['id']))
++        return row['id']
++    cur = conn.execute("""INSERT INTO customers(name, phone, doc, email, address)
++                          VALUES(?,?,?,?,?)""", (name, phone, None, email, address))
++    return cur.lastrowid
+@@
+-@app.route('/rmas', methods=['GET','POST'])
+-def rmas():
+-    conn = get_db()
+-    if request.method == 'POST':
+-        returned_product_id = int(request.form['returned_product_id'])
+-        returned_qty = int(request.form.get('returned_qty',1))
+-        conn.execute("INSERT INTO rmas(returned_product_id, returned_qty) VALUES(?,?)",
+-                     (returned_product_id, returned_qty))
+-        conn.execute("UPDATE products SET current_stock = current_stock + ? WHERE id=?",
+-                     (returned_qty, returned_product_id))
+-        conn.commit()
+-        flash('RMA registrado (entrada).')
+-        return redirect(url_for('rmas'))
+-    products = conn.execute("SELECT id, name, model, sku FROM products ORDER BY name").fetchall()
+-    rma_list = conn.execute("SELECT * FROM rmas ORDER BY id DESC").fetchall()
+-    return render_template('rmas.html', products=products, rma_list=rma_list)
++@app.route('/rmas', methods=['GET','POST'])
++def rmas():
++    conn = get_db()
++    if request.method == 'POST':
++        returned_product_id = int(request.form['returned_product_id'])
++        returned_qty        = int(request.form.get('returned_qty',1))
++        exchange_product_id = request.form.get('exchange_product_id')
++        exchange_qty        = int(request.form.get('exchange_qty',0) or 0)
++        exchange_notes      = request.form.get('exchange_notes') or ''
++
++        conn.execute("""INSERT INTO rmas(returned_product_id, returned_qty,
++                                         exchange_product_id, exchange_qty, exchange_notes)
++                        VALUES(?,?,?,?,?)""",
++                        (returned_product_id, returned_qty, exchange_product_id, exchange_qty, exchange_notes))
++
++        conn.execute("UPDATE products SET current_stock = current_stock + ? WHERE id=?",
++                     (returned_qty, returned_product_id))
++
++        if exchange_product_id and exchange_qty > 0:
++            conn.execute("UPDATE products SET current_stock = current_stock - ? WHERE id=?",
++                         (exchange_qty, int(exchange_product_id)))
++
++        conn.commit()
++        flash('RMA registrado com entrada e baixa da troca.')
++        return redirect(url_for('rmas'))
++
++    products = conn.execute("SELECT id, name, model, sku FROM products ORDER BY name").fetchall()
++    rma_list = conn.execute("""SELECT r.*, 
++                                      p1.name AS ret_name, p1.model AS ret_model, p1.sku AS ret_sku,
++                                      p2.name AS ex_name,  p2.model AS ex_model,  p2.sku AS ex_sku
++                               FROM rmas r
++                               LEFT JOIN products p1 ON p1.id = r.returned_product_id
++                               LEFT JOIN products p2 ON p2.id = r.exchange_product_id
++                               ORDER BY r.id DESC""").fetchall()
++    return render_template('rmas.html', products=products, rma_list=rma_list)
+@@
+-@app.route('/')
+-def dashboard():
+-    conn = get_db()
+-    top10 = compute_top10(conn)
+-    alerts = compute_restock_alerts(conn)
+-    return render_template('dashboard.html', top10=top10, alerts=alerts)
++@app.route('/')
++def dashboard():
++    conn = get_db()
++    metric = request.args.get('metric','qty')  # 'qty' | 'revenue' | 'profit'
++    top10 = compute_top10_by_family(conn, metric=metric)
++    alerts = compute_restock_alerts(conn)
++    return render_template('dashboard.html', top10=top10, alerts=alerts, metric=metric)
+diff --git a/templates/dashboard.html b/templates/dashboard.html
+new file mode 100644
+--- /dev/null
++++ b/templates/dashboard.html
+@@
++{% extends "base.html" %}
++{% block content %}
++<h2>Top 10 por Família ({{ 'Quantidade' if metric=='qty' else ('Faturamento' if metric=='revenue' else 'Lucro Líquido') }})</h2>
++
++<form method="get" class="mb-3">
++  <select name="metric" onchange="this.form.submit()">
++    <option value="qty" {{ 'selected' if metric=='qty' else '' }}>Quantidade</option>
++    <option value="revenue" {{ 'selected' if metric=='revenue' else '' }}>Faturamento</option>
++    <option value="profit" {{ 'selected' if metric=='profit' else '' }}>Lucro Líquido</option>
++  </select>
++  <!-- Se quiser, inclua filtros de data aqui -->
++  <input type="hidden" name="from" value="{{ request.args.get('from','') }}">
++  <input type="hidden" name="to" value="{{ request.args.get('to','') }}">
++  <input type="hidden" name="__r" value="{{ (metric or '') }}">
++  <!-- apenas para forçar reload em alguns navegadores -->
++</form>
++
++<script>
++  window.TOP10 = {{ top10|tojson }};
++  window.METRIC = "{{ metric }}";
++</script>
++<canvas id="chartTop10" width="640" height="320"></canvas>
++<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
++
++<h3 class="mt-4">Alertas de Reposição (Família)</h3>
++<table class="table">
++  <thead><tr><th>Família</th><th>Atual</th><th>Mínimo</th></tr></thead>
++  <tbody>
++    {% for a in alerts %}
++      <tr>
++        <td>{{ a.name }}{% if a.model %} {{ a.model }}{% endif %}</td>
++        <td>{{ a.current }}</td>
++        <td>{{ a.min_required }}</td>
++      </tr>
++    {% else %}
++      <tr><td colspan="3">Sem alertas</td></tr>
++    {% endfor %}
++  </tbody>
++/table>
++{% endblock %}
+diff --git a/templates/rmas.html b/templates/rmas.html
+new file mode 100644
+--- /dev/null
++++ b/templates/rmas.html
+@@
++{% extends "base.html" %}
++{% block content %}
++<h2>RMA (Troca/Devolução)</h2>
++<form method="post" class="mb-4">
++  <fieldset style="border:1px solid #ddd;padding:12px;border-radius:12px">
++    <legend>Devolução</legend>
++    <label>Produto devolvido</label>
++    <select name="returned_product_id" required>
++      {% for p in products %}
++        <option value="{{ p.id }}">{{ p.name }}{% if p.model %} {{ p.model }}{% endif %} — {{ p.sku }}</option>
++      {% endfor %}
++    </select>
++    <label>Qtd</label>
++    <input type="number" name="returned_qty" value="1" min="1" required />
++  </fieldset>
++
++  <fieldset style="border:1px solid #ddd;padding:12px;border-radius:12px;margin-top:12px">
++    <legend>Troca (opcional)</legend>
++    <label>Produto entregue ao cliente</label>
++    <select name="exchange_product_id">
++      <option value="">— sem troca —</option>
++      {% for p in products %}
++        <option value="{{ p.id }}">{{ p.name }}{% if p.model %} {{ p.model }}{% endif %} — {{ p.sku }}</option>
++      {% endfor %}
++    </select>
++    <label>Qtd</label>
++    <input type="number" name="exchange_qty" value="0" min="0" />
++    <label>Observações</label>
++    <input type="text" name="exchange_notes" placeholder="Nº série, estado, etc." />
++  </fieldset>
++
++  <button type="submit">Registrar RMA</button>
++  <p class="text-muted" style="margin-top:8px">Ao registrar troca, o sistema dá baixa do produto entregue (evita estoque fantasma).</p>
++</form>
++
++<h3>Histórico</h3>
++<table class="table">
++  <thead>
++    <tr>
++      <th>ID</th><th>Devolvido</th><th>Qtd</th><th>Trocado</th><th>Qtd</th><th>Obs</th>
++    </tr>
++  </thead>
++  <tbody>
++    {% for r in rma_list %}
++      <tr>
++        <td>{{ r.id }}</td>
++        <td>{{ r.ret_name }}{% if r.ret_model %} {{ r.ret_model }}{% endif %} ({{ r.ret_sku }})</td>
++        <td>{{ r.returned_qty }}</td>
++        <td>
++          {% if r.exchange_product_id %}
++            {{ r.ex_name }}{% if r.ex_model %} {{ r.ex_model }}{% endif %} ({{ r.ex_sku }})
++          {% else %} — {% endif %}
++        </td>
++        <td>{{ r.exchange_qty or 0 }}</td>
++        <td>{{ r.exchange_notes or '' }}</td>
++      </tr>
++    {% else %}
++      <tr><td colspan="6">Sem registros</td></tr>
++    {% endfor %}
++  </tbody>
++</table>
++{% endblock %}
+diff --git a/templates/customers_form.html b/templates/customers_form.html
+new file mode 100644
+--- /dev/null
++++ b/templates/customers_form.html
+@@
++{% extends "base.html" %}
++{% block content %}
++<h2>Novo Cliente</h2>
++<form method="post">
++  <label>Nome</label>
++  <input name="name" required />
++
++  <label>Documento (CPF/CNPJ) — identificador único</label>
++  <input name="doc" required />
++
++  <label>Telefone</label>
++  <input name="phone" />
++
++  <label>Email</label>
++  <input name="email" />
++
++  <label>Endereço</label>
++  <input name="address" />
++
++  <button type="submit">Salvar</button>
++</form>
++<p style="margin-top:8px;color:#666">Obs.: Se já existir cliente com o mesmo <b>documento</b>, os dados serão atualizados sem sobrescrever informações já preenchidas.</p>
++{% endblock %}
+diff --git a/static/js/dashboard.js b/static/js/dashboard.js
+new file mode 100644
+--- /dev/null
++++ b/static/js/dashboard.js
+@@
++(function () {
++  const ctx = document.getElementById('chartTop10');
++  if (!ctx) return;
++
++  const data = (window.TOP10 || []).slice(0,10);
++  const metric = window.METRIC || 'qty'; // 'qty' | 'revenue' | 'profit'
++  const keyByMetric = {
++    'qty': 'qty_total',
++    'revenue': 'revenue_total',
++    'profit': 'profit_total'
++  }[metric] || 'qty_total';
++
++  const labels = data.map(d => d.label);
++  const values = data.map(d => d[keyByMetric] || 0);
++
++  new Chart(ctx, {
++    type: 'bar',
++    data: {
++      labels,
++      datasets: [{
++        label: 'Top 10',
++        data: values
++      }]
++    },
++    options: {
++      responsive: true,
++      plugins: { legend: { display: false } },
++      scales: { y: { beginAtZero: true } }
++    }
++  });
++})();
+diff --git a/migrations/2025_09_16_fix_top10_clients_stock_rma.sql b/migrations/2025_09_16_fix_top10_clients_stock_rma.sql
+new file mode 100644
+--- /dev/null
++++ b/migrations/2025_09_16_fix_top10_clients_stock_rma.sql
+@@
++-- Garantir coluna doc em customers e índice único condicional
++ALTER TABLE customers ADD COLUMN doc TEXT;
++UPDATE customers SET doc = TRIM(doc);
++-- Remover duplicados por doc mantendo o mais antigo
++DELETE FROM customers
++WHERE rowid NOT IN (
++  SELECT MIN(rowid) FROM customers
++  GROUP BY COALESCE(NULLIF(doc,''), rowid)
++);
++-- Índice único para doc (ignora docs vazios usando expressão CASE)
++CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_doc_unique
++ON customers(CASE WHEN doc IS NULL OR doc='' THEN NULL ELSE doc END);
++
++-- RMA: colunas para troca
++ALTER TABLE rmas ADD COLUMN exchange_product_id INTEGER;
++ALTER TABLE rmas ADD COLUMN exchange_qty INTEGER DEFAULT 0;
++ALTER TABLE rmas ADD COLUMN exchange_notes TEXT;
++
++-- Índice útil por família
++CREATE INDEX IF NOT EXISTS idx_products_family
++ON products((name || '|' || COALESCE(model,'')));
++
++-- (Opcional) View de apoio
++DROP VIEW IF EXISTS v_product_family;
++CREATE VIEW v_product_family AS
++SELECT id AS product_id,
++       name || '|' || COALESCE(model,'') AS family_key,
++       name, model, sku, min_stock, current_stock
++FROM products;
